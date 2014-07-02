@@ -4,7 +4,8 @@ from redis.connection import (
     ConnectionPool,
     Connection,
     SSLConnection,
-    UnixDomainSocketConnection
+    UnixDomainSocketConnection,
+    ShardedConnectionPool
 )
 from redis.utils import from_url
 from redis.exceptions import (
@@ -18,7 +19,8 @@ from redis.exceptions import (
     RedisError,
     ResponseError,
     TimeoutError,
-    WatchError
+    WatchError,
+    ShardingError,
 )
 
 

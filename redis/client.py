@@ -549,7 +549,7 @@ class StrictRedis(object):
         "Execute a command and return a parsed response"
         pool = self.connection_pool
         command_name = args[0]
-        connection = pool.get_connection(command_name, **options)
+        connection = pool.get_connection(command_name, *args[1:], **options)
         try:
             connection.send_command(*args)
             return self.parse_response(connection, command_name, **options)
@@ -2619,3 +2619,5 @@ class Script(object):
             # that created this instance?
             self.sha = client.script_load(self.script)
             return client.evalsha(self.sha, len(keys), *args)
+
+

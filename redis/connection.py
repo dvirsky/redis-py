@@ -7,6 +7,7 @@ import socket
 import sys
 import threading
 import warnings
+from redis.deps import hash_ring
 
 try:
     import ssl
@@ -27,7 +28,9 @@ from redis.exceptions import (
     AuthenticationError,
     NoScriptError,
     ExecAbortError,
-    ReadOnlyError
+    ReadOnlyError,
+    ShardingError,
+
 )
 from redis.utils import HIREDIS_AVAILABLE
 if HIREDIS_AVAILABLE:
@@ -826,7 +829,7 @@ class ConnectionPool(object):
                 self.disconnect()
                 self.reset()
 
-    def get_connection(self, command_name, *keys, **options):
+    def get_connection(self, command_name, *args, **options):
         "Get a connection from the pool"
         self._checkpid()
         try:
@@ -925,7 +928,7 @@ class BlockingConnectionPool(ConnectionPool):
         self._connections.append(connection)
         return connection
 
-    def get_connection(self, command_name, *keys, **options):
+    def get_connection(self, command_name, *args, **options):
         """
         Get a connection, blocking for ``self.timeout`` until a connection
         is available from the pool.
@@ -976,3 +979,139 @@ class BlockingConnectionPool(ConnectionPool):
         "Disconnects all connections in the pool."
         for connection in self._connections:
             connection.disconnect()
+
+
+
+
+
+class ShardedConnectionPool(object):
+    """
+    A connection pool supporting automatic sharding by request key.
+    What it does basically is keep a connection pool per host:port and deciding which pool to use based on the query key
+    """
+
+    #These commands are totally forbidden as they refer to multiple keys and can refer to keys on separate shards
+    FORBIDDEN_COMMANDS = {'KEYS', 'MGET', 'MSET', 'MSETNX', 'PFMERGE', 'BITOP',
+                          'RENAME', 'RENAMENX', #new key can be in a different shard...
+                          'SDIFF', 'SDIFFSTORE', 'SINTER', 'SINTERSTORE', 'SMOVE', 'SUNION', 'SUNIONSTORE' #Multi-set operations
+                          'SORT', #No guarantee that everything is on the same shard
+                          'ZINTERSTORE', 'ZUNIONSTORE'  }
+
+    #these commands can be used but only with single keys
+    RESTRICTED_COMMANDS = {'BLPOP', 'BRPOP', 'DEL', 'PFCOUNT', 'WATCH'}
+
+    def __init__(self, nodes,  pool_class=ConnectionPool,  *pool_args, **pool_kwargs):
+        """
+        @param nodes a list of (host, port) tuples of the current nodes
+        @param pool_class the class type for the underlying connection pool
+        @param pool_args args to pass to each sub-pool when creating it
+        @param pool_kwargs kwargs to pass to each sub-pool when creating it
+        """
+
+        self.nodes= nodes
+        self.ring = hash_ring.HashRing(nodes)
+        self.pool_class = pool_class
+        self.pool_args = pool_args or []
+        self.pool_kwargs = pool_kwargs or {}
+        self.pools = {}
+        self.pid = os.getpid()
+
+        self._lock = threading.Lock()
+
+    def update_nodes(self, nodes):
+        """
+        Upadte the node list and recreate the hash ring.
+        This should be called from a discovery system when a node is added or removed.
+        We do not remove non functioning nodes automatically.
+        """
+        with self._lock:
+            self.nodes = nodes
+            self.ring = hash_ring.HashRing(nodes)
+            self.pools = {}
+
+
+    def _get_pool(self, key):
+        """
+        Get the relevant connection pool based on a key.
+        This is where the actual sharding takes place
+        """
+
+        self._checkpid()
+        node = self.ring.get_node(key)
+        try:
+            return self.pools[node]
+        except KeyError:
+            with self._lock:
+                #double checking to avoid re-creating the pool
+                try:
+                    return self.pools[node]
+                except KeyError:
+                    pool = self.pool_class(host=node[0], port=node[1], *self.pool_args, **self.pool_kwargs)
+                    self.pools[node] = pool
+                    return pool
+
+
+    def _verify_command(self, command_name, *args):
+        """
+        Take the command and arguments, and make sure either the command is supported in sharded mode, or it uses one key
+        Raises a ShardingCommandNotSupported exception if the command is invalid
+        """
+
+        # Check if this is a totally unsupported command (e.g. ZINTERSTORE, MGET)
+        if command_name in ShardedConnectionPool.FORBIDDEN_COMMANDS:
+            raise ShardingError("{} not supported in sharded mode".format(command_name))
+
+        # "Restricted" commands are okay as long as they're used with one key
+        elif command_name in ShardedConnectionPool.RESTRICTED_COMMANDS:
+            if len(args) <= 1 or (command_name in ('BLPOP', 'BRPOP') and isinstance(args[-1], int)):
+                    return
+            raise ShardingError("{} not supported in sharded mode with more than one key".format(command_name))
+
+
+
+    def get_connection(self, command_name, *args, **options):
+        "Get a connection from the pool"
+        self._checkpid()
+
+        self._verify_command(command_name, *args)
+
+        #print keys
+        key = str(args[0]) if args else ''
+
+        pool = self._get_pool(key)
+
+        return pool.get_connection(command_name, *args, **options)
+
+    def reset(self):
+        self.pid = os.getpid()
+        self._lock = threading.Lock()
+        self.pools = {}
+
+    def _checkpid(self):
+        if self.pid != os.getpid():
+            with self._lock:
+                if self.pid == os.getpid():
+                    # another thread already did the work while we waited
+                    # on the lock.
+                    return
+                self.disconnect()
+                self.reset()
+
+
+    def release(self, connection):
+        "Releases the connection back to the relevant pool"
+        self._checkpid()
+        if connection.pid != self.pid:
+            return
+
+        try:
+            pool = self.pools[(connection.host,connection.port)]
+            pool.release(connection)
+        except KeyError:
+            pass
+
+    def disconnect(self):
+        "Disconnects all connections in all pools"
+        for pool in self.pools.itervalues():
+            pool.disconnect()
+

@@ -69,3 +69,8 @@ class LockError(RedisError, ValueError):
     # NOTE: For backwards compatability, this class derives from ValueError.
     # This was originally chosen to behave like threading.Lock.
     pass
+
+
+class ShardingError(RedisError):
+    pass
+

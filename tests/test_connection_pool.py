@@ -15,6 +15,9 @@ class DummyConnection(object):
 
     def __init__(self, **kwargs):
         self.kwargs = kwargs
+        self.host = kwargs.get('host')
+        self.port = kwargs.get('port')
+        self.db = kwargs.get('db')
         self.pid = os.getpid()
 
 
@@ -400,3 +403,106 @@ class TestConnection(object):
             'UnixDomainSocketConnection',
             'path=/path/to/socket,db=0',
         )
+
+
+
+
+class TestShardedConnectionPool(object):
+
+    def get_pool(self, nodes, pool_class=redis.ConnectionPool, connection_kwargs=None, max_connections=None,
+                 connection_class=DummyConnection):
+        connection_kwargs = connection_kwargs or {}
+        pool = redis.ShardedConnectionPool(nodes,
+            pool_class=pool_class,
+            connection_class=connection_class,
+            max_connections=max_connections,
+            **connection_kwargs)
+        return pool
+
+    def test_create_pool(self):
+
+        nodes = [('localhost', 6379), ('localhost', 6380)]
+        pool = self.get_pool(nodes)
+        assert pool.pool_class == redis.ConnectionPool
+        assert pool.nodes == nodes
+        assert pool.ring is not None
+        assert pool.pools == {}
+
+    def test_getpool(self):
+
+        nodes = [('localhost', 6377)]
+        db = 11
+        pool = self.get_pool(nodes, connection_kwargs={'db': db})
+
+        subpool = pool._get_pool('foo')
+        assert subpool.__class__ == pool.pool_class
+
+        conn = subpool.get_connection('PING')
+        assert conn.host == nodes[0][0]
+        assert conn.port == nodes[0][1]
+        assert conn.db == db
+
+
+    def test_sharding(self):
+
+        nodes = [('localhost', 6377), ('localhost', 6379) ]
+
+        pool = self.get_pool(nodes)
+
+        #these keys are arbitrary but should be stable
+        conn = pool.get_connection('GET', 'fooz')
+        assert conn.port == nodes[1][1]
+        conn = pool.get_connection('GET', 'baz')
+        assert conn.port == nodes[0][1]
+
+
+
+    def test_update_nodes(self):
+
+        nodes = [('localhost', 6377), ('localhost', 6379) ]
+
+        pool = self.get_pool(nodes)
+
+        assert pool.pools == {}
+        _ = pool._get_pool('fooz')
+        _ = pool._get_pool('baz')
+        assert len(pool.pools) == 2
+
+        nodes = nodes[:1]
+        #now we reset the nodes...
+        pool.update_nodes(nodes)
+        assert pool.pools == {}
+        _ = pool._get_pool('fooz')
+        subpool = pool._get_pool('baz')
+        assert len(pool.pools) == 1
+        conn = subpool.get_connection('GET')
+        assert conn.port == nodes[0][1]
+
+    def test_command_filtering(self):
+
+        nodes = [('localhost', 6377)]
+
+        pool = self.get_pool(nodes)
+
+        c = pool.get_connection('GET')
+        assert c != None
+        c = pool.get_connection('HGET')
+        assert c != None
+        c = pool.get_connection('SET')
+        assert c != None
+
+        #Make sure all forbidden commands raise an exception
+        for cmd in redis.ShardedConnectionPool.FORBIDDEN_COMMANDS:
+
+            with pytest.raises(redis.ShardingError):
+                pool.get_connection(cmd)
+
+
+        for cmd in redis.ShardedConnectionPool.RESTRICTED_COMMANDS:
+
+            with pytest.raises(redis.ShardingError):
+                pool.get_connection(cmd, 'k1', 'k2')
+
+            c = pool.get_connection(cmd, 'k1')
+
+            assert c != None
